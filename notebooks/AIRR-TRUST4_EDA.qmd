@@ -1,0 +1,508 @@
+---
+title: "Adaptive Immune Receptor Repertoire"
+editor: visual
+author: "Joe Boktor, Zach Martinez"
+date: '2023-04-28'
+format: 
+  html:
+    font-family: helvetica neue
+    page-layout: full
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    self-contained: true
+    code-fold: true
+    code-tools: true
+    fig-align: center
+bibliography: references.bib
+---
+
+# 1. Background
+
+## Dataset Source:
+
+This dataset is provided by the Accelerating Medicines Partnership Parkinson's Disease [(AMP-PD)](https://amp-pd.org/) consortium. The Mazmanian Lab has obtained tier-2 access to genomic and clinical profiles for roughly 10,000 Parkinson's Disease (PD) and Control Samples. This rich multiomic dataset contains whole blood Whole Genome Sequencing (WGS), Bulk RNA-Seq, and targeted Proteomics as well detailed clinical metadata for many samples.
+
+For this project, we are interested in examining the adaptive immune receptor repertoires of Parkinson's Disease Patients and controls. Recent advances have enabled de-convolution and assembly of individual TCR and BCR sequences from Bulk RNA-Sequencing[@song2021]. We have applied the TRUST4 [WDL pipeline](https://portal.firecloud.org/?return=terra#methods/TRUST4_bam_hg38_JB/TRUST4_bam_hg38_JB/3) to 1,998 AMP-PD RNA-Seq profiles and have aggregated the output files from a google cloud storage bucket into a shareable file.
+
+## **Objectives**:
+
+Classical methods for comparing biological sequences usually involve pairwise comparisons [@altschul_basic_1990] or by using Hidden-Markov Models [@eddy_accelerated_2011]. While these methods rely on evolutionary relationships to link related sequences through homology, machine learning based methods have shown success for functional comparisons without needing shared ancestry. However, these methods tend to rely heavily on feature selection, which not only requires background knowledge but also introduce potential bias by focusing on select features. Analogous to using words and sentences to train models such as BERT, Transformer based models such as ESM-2 use amino acids and protein sequences [@lin_evolutionary-scale_2022]. These Protein Language Models (PLMs) learn in a self-supervised manner, where the model attempts to predict the identity of a random 15% of the amino acids per sequence using the un-masked portions. ESM-2, was pre-trained on the masked language training task with 65 million unique protein sequences from UniRef. After this deep training, scientists are able to use these pre-trained models to extract high-dimensional representations for their proteins of interest. These vectors can then be used for clustering, classification and other downstream tasks that allow for functional comparisons [@bernhofer_tmbed_2022]. We plan on embedding the receptor repertoires and feeding them to downstream classification/clustering models to potentially gain deeper insights into P.D.
+
+# 2. Loading and Processing Data
+
+```{r}
+#| warning: false
+
+# Load packages
+library(googleCloudStorageR)
+library(tidyverse)
+library(magrittr)
+library(janitor)
+library(styler)  
+library(glue)
+library(listenv)
+library(furrr)
+library(tictoc)
+library(progress)
+library(ggpubr)
+library(strex)
+library(seqinr)
+library(ape)
+library(msa)
+library(reshape2)
+library(kableExtra)
+library(DT)
+library(plotly)
+wkdir <- strex::str_before_last(getwd(), "/")
+data_dir <- glue("{wkdir}/data")
+src_dir <- glue("{wkdir}/notebooks")
+```
+
+\*\*Note: this section requires access to private Google storage bucket, downstream products of this bucket will have open access.
+
+Setting up google cloud storage access.
+
+```{r, eval=FALSE}
+## Fetch token. See: https://developers.google.com/identity/protocols/oauth2/scopes
+scope <-c("https://www.googleapis.com/auth/cloud-platform")
+token <- gargle::token_fetch(scopes = scope)
+```
+
+```{r, eval=FALSE}
+googleCloudStorageR::gcs_auth(token = token)
+```
+
+Identifying paths to files of interest.
+
+```{r, eval=FALSE}
+# Set the storage bucket location
+bucket_name <- "gs://fc-secure-2738c438-e693-4853-84ba-5c0d3ee1f291"
+gcs_get_bucket(bucket_name)
+
+# List the files in the bucket
+bucket_files <- gcs_list_objects(bucket_name)
+
+trust4_file_paths <- list()
+trust4_file_paths[["cdr3"]] <- bucket_files %>% 
+  filter(grepl("_cdr3.out", name))
+trust4_file_paths[["final_assemblies"]] <- bucket_files %>% 
+  filter(grepl("_final.out", name))
+trust4_file_paths[["final_reports"]] <- bucket_files %>% 
+  filter(grepl("_report.tsv", name))
+
+saveRDS(
+  trust4_file_paths, 
+  file = glue("{project_dir}/data/interim/airr/trust4_file-paths.rds")
+)
+
+```
+
+Downloading TRUST4 output files.
+
+```{r, eval=FALSE}
+#' Function to download and parse data from Google Storage directly
+#' into an R object
+download_trust4_data <- function(file_path, ...) {
+  sample_name <- basename(file_path) %>% str_remove("_report.tsv")
+  gcs_get_object(bucket = bucket_name, file_path) %>% 
+    mutate(sample_id = sample_name)
+}
+```
+
+```{r, eval=FALSE}
+trust4_file_paths <- readRDS(
+  file = glue("{project_dir}/data/interim/airr/trust4_file-paths.rds")
+)
+tic()
+airr_reports <-
+  trust4_file_paths$final_reports$name[1:2000] %>%
+  set_names() %>%
+  purrr::map( ~download_trust4_data(.))
+toc()
+
+saveRDS(
+  airr_reports, 
+  file = glue("{project_dir}/data/interim/airr/trust4_reports_list.rds")
+)
+airr_reports_df <- bind_rows(airr_reports)
+saveRDS(
+  airr_reports_df, 
+  file = glue("{project_dir}/data/interim/airr/trust4_reports.rds")
+)
+
+```
+
+# 3. Exploratory Data Analysis
+
+Environment setup.
+
+```{r}
+#| warning: false
+
+devtools::source_url(
+  glue(
+   "https://raw.githubusercontent.com/jboktor/",
+  "RIMA_pipeline/master/src/immune_repertoire/trust4_metric_functions.R"
+  ))
+
+source(glue("{src_dir}/R_scripts/_misc_functions.R"))
+
+```
+
+Loading in metadata.
+
+```{r}
+metadata_categories <- 
+  readRDS(glue("{data_dir}/interim/metadata/2022-11-04_metadata_categories.rds"))
+
+metadata_of_interest <- 
+  c(
+  metadata_categories$medical_history[[1]],
+  metadata_categories$demographics[[1]]
+  )
+
+static_metdata <- 
+  readRDS(glue("{data_dir}/interim/metadata/2022-11-04_static_metdata.rds")) %>% 
+  dplyr::select(contains(metadata_of_interest))
+rnaseq_inv <- read.csv(
+  file = glue(
+    "{data_dir}/input/metadata/2021_v2-5release_0510/",
+    "rna_sample_inventory.csv"
+    ),
+  stringsAsFactors = F, header = TRUE
+)
+
+meta_RNASeq <- rnaseq_inv %>% 
+  left_join(static_metdata, by = "participant_id")
+
+
+# saveRDS(
+#   meta_RNASeq,
+#   glue("{data_dir}/interim/metadata/RNAseq-metadata.rds")
+# )
+
+```
+
+Static Participant Metadata
+
+```{r}
+#| tbl-cap: "Bulk RNA-Seq sample inventory"
+
+meta_RNASeq %>% 
+  slice_sample(n = 100) %>% 
+  DT::datatable(options = list(scrollX = TRUE))
+
+```
+
+Loading in aggregated TRUST4 reports
+
+```{r, eval=FALSE}
+airr_reports_df_processed <-
+  readRDS(
+    file = glue("{data_dir}/interim/airr/trust4_reports.rds")
+  ) %>%
+  dplyr::rename(sample = sample_id) %>% 
+  dplyr::rename(count = `#count`) %>%
+  mutate(is_complete = if_else(
+    CDR3aa %nin% c("partial", "out_of_frame") &
+      !grepl("_", CDR3aa) & !grepl("\\?", CDR3aa), "Yes", "No"
+  ))
+
+# annotate TCR / BCR and light/heavy chains
+airr_reports_df_processed %<>%
+  mutate(
+    receptor_class = case_when(
+      grepl("^IG", V) | grepl("^IG", J) | grepl("^IG", C) ~ "BCR",
+      grepl("^TR", V) | grepl("^TR", J) | grepl("^TR", C) ~ "TCR",
+      TRUE ~ "ERROR"
+    )
+  ) %>%
+  # split BCR into heavy chain and light chain
+  mutate(
+    receptor_chain = case_when(
+      receptor_class == "BCR" &
+        (grepl("^IGH", V) | grepl("^IGH", J) | grepl("^IGH", C)) ~ "heavy",
+      receptor_class == "BCR" &
+        (
+          grepl("^IG[K|L]", V) |
+            grepl("^IG[K|L]", J) | grepl("^IG[K|L]", C)
+        ) ~ "light",
+      receptor_class == "TCR" ~ "",
+      TRUE ~ "ERROR"
+    )
+  ) %>%
+  group_by(sample, receptor_class) %>%
+  mutate(lib.size = sum(count)) %>%
+  ungroup()
+
+saveRDS(
+  airr_reports_df_processed,
+  file = glue(
+    "{data_dir}/interim/airr/{Sys.Date()}_trust4_reports-processed.rds"
+  )
+)
+
+```
+
+Visualizing a small subset of AIRR data.
+
+```{r}
+airr_reports_df_processed <- readRDS(
+  file = glue(
+    "{data_dir}/interim/airr/2023-04-27_trust4_reports-processed.rds"
+  )
+)
+
+airr_reports_df_processed %>%
+  slice_sample(n = 100) %>%
+  DT::datatable(options = list(scrollX = TRUE))
+```
+
+Saving fasta file of a subsample of TCRs for embedding into ESM2 T12-35M
+
+```{r, eval=FALSE}
+
+tcr_df <- airr_reports_df_processed %>% 
+  filter(receptor_class == "TCR") %>% 
+  filter(CDR3aa != "out_of_frame") %>% 
+  dplyr::rename(sample_id = sample) %>% 
+  left_join(meta_RNASeq, by = "sample_id")
+
+# subsample dataset equally by condition
+set.seed(42)
+rand_id <- 
+  tcr_df %>% 
+  select(sample_id, case_control_other_latest) %>% 
+  filter(case_control_other_latest != "Other") %>% 
+  distinct() %>% 
+  group_by(case_control_other_latest) %>% 
+  slice_sample(n = 20) %>% 
+  pull(sample_id)
+
+tcr_df_subsamp <- tcr_df %>% 
+  filter(sample_id %in% rand_id) %>% 
+  distinct() %>% 
+  rownames_to_column("rownumm")
+  
+seqs <- tcr_df_subsamp %>% pull(CDR3aa)
+headers <- 
+  tcr_df_subsamp %>% 
+  mutate(fasta_header = 
+           glue("{rownumm}-{cid}-{sample_id}_{case_control_other_latest}")) %>% 
+  pull(fasta_header)
+
+write.fasta(
+  sequences = as.list(seqs),
+  names = as.list(headers),
+  file.out = glue("{wkdir}/20_case_control_TCR_CDR3aa.fasta"),
+  open = "w",
+  nbchar = 1e100,
+  as.string = FALSE
+)
+
+```
+
+## Immune Repertoire Analysis
+
+```{r}
+bcr.heavy <- airr_reports_df_processed %>% filter(receptor_chain == "heavy")
+bcr.light <- airr_reports_df_processed %>% filter(receptor_chain == "light")
+tcr <- airr_reports_df_processed %>% filter(receptor_class == "TCR")
+
+# TCR CPK
+tcr_cpk <- aggregate(CDR3aa ~ sample + lib.size, tcr, function(x) length(unique(x))) %>%
+  mutate(CPK = signif(CDR3aa / (lib.size / 1000), 4))
+
+bcr.heavy_cpk <- aggregate(CDR3aa ~ sample + lib.size, bcr.heavy, function(x) length(unique(x))) %>%
+  mutate(CPK = signif(CDR3aa / (lib.size / 1000), 4))
+
+bcr.light_cpk <- aggregate(CDR3aa ~ sample + lib.size, bcr.light, function(x) length(unique(x))) %>%
+  mutate(CPK = signif(CDR3aa / (lib.size / 1000), 4))
+
+```
+
+```{r, eval=FALSE}
+
+bcr_lineage <- tibble()
+bcr_clonality <- tibble()
+tcr_clonality <- tibble()
+
+library(progress)
+sample_ids <- unique(airr_reports_df_processed$sample)
+pb <- progress_bar$new(total = length(sample_ids))
+
+for (id in sample_ids) {
+  pb$tick()
+  BCRLin <- BuildBCRlineage(
+    sampleID = id,
+    Bdata = bcr.heavy,
+    start = 3, end = 10
+  )
+  bcr_lineage %<>% bind_rows(BCRLin)
+
+  # BCR clonality and entropy
+  single_sample_bcr_clonality <- 
+    getClonality(id, bcr.heavy, start = 3, end = 10)
+  bcr_clonality %<>% bind_rows(single_sample_bcr_clonality)
+
+  # TCR clonality and entropy
+  single_sample_tcr_clonality <- 
+    getClonalityTCR(id, tcr)
+  tcr_clonality %<>% bind_rows(single_sample_tcr_clonality)
+}
+
+bcr_lineage %>% glimpse()
+bcr_clonality %>% glimpse()
+tcr_clonality %>% glimpse()
+rima_metrics <- list(
+  "bcr_lineage" = bcr_lineage,
+  "bcr_clonality" = bcr_clonality,
+  "tcr_clonality" = tcr_clonality
+)
+
+saveRDS(rima_metrics, 
+        glue("{data_dir}/interim/{Sys.Date()}_RIMA-TRUST4_metrics.rds"))
+
+```
+
+```{r}
+
+rima_metrics <- readRDS(glue("{data_dir}/interim/airr/2023-04-27_RIMA-TRUST4_metrics.rds"))
+bcr_lineage <- rima_metrics[["bcr_lineage"]]
+bcr_clonality <- rima_metrics[["bcr_clonality"]]
+tcr_clonality <- rima_metrics[["tcr_clonality"]]
+
+```
+
+```{r}
+#| fig-cap: Visualizing clonotypes per kilo-reads (CPK)
+#| fig-width: 8
+#| fig-height: 6
+
+cpk_df <- 
+  bind_rows(
+    bcr.heavy_cpk %>% mutate(group = "BCR Heavy"),
+    bcr.light_cpk %>% mutate(group = "BCR Light"),
+    tcr_cpk %>% mutate(group = "TCR"),
+  )
+
+cpk_df %>%
+  dplyr::rename(sample_id = sample) %>%
+  left_join(meta_RNASeq, by = "sample_id") %>%
+  ggplot(aes(x = case_control_other_latest, y = CPK)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_point(aes(fill = case_control_other_latest), 
+             position = position_jitterdodge(), alpha = 0.2) +
+  stat_compare_means() +
+  facet_wrap(~group) +
+  scale_y_log10() +
+  theme_light() +
+  labs(x = NULL, y = "Clonotypes per kilo-reads (CPK)") +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+#| fig-cap: TCR and BCR Clonality
+#| fig-width: 8
+#| fig-height: 6
+
+clonality_df <- 
+  bind_rows(
+    tcr_clonality %>% mutate(cell_type = "TCR"),
+    bcr_clonality %>% mutate(cell_type = "BCR")
+  )
+
+clonality_df %>%
+  mutate(clonality = as.numeric(clonality)) %>%
+  dplyr::rename(sample_id = sample) %>%
+  left_join(meta_RNASeq) %>%
+  ggplot(aes(x = case_control_other_latest, y = clonality)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_point(aes(fill = case_control_other_latest), 
+             position = position_jitterdodge(), alpha = 0.2) +
+  labs(x = NULL, y = "Clonality") +
+  facet_wrap(~cell_type) +
+  scale_y_log10() +
+  stat_compare_means() +
+  theme_light() +
+  theme(legend.position = "none")
+
+```
+
+Visualizing Immunoglobulin Isotype frequency
+
+```{r}
+#| fig-cap: Immunoglobulin Isotype frequency across PD and Controls.
+#| fig-width: 15
+#| fig-height: 8
+#| warning: false
+
+# Ig isotype frequency
+ig_freq <- bcr.heavy %>%
+  group_by(sample) %>%
+  mutate(est_clonal_exp_norm = frequency / sum(frequency)) %>% 
+  dplyr::filter(C != "*" & C != ".") %>%
+  group_by(sample, C) %>%
+  dplyr::summarize(Num.Ig = sum(est_clonal_exp_norm))
+
+# Sample and Ig Isotype clustering
+ig_freq_matrix <- ig_freq %>%
+  pivot_wider(values_from = "Num.Ig", names_from = "sample") %>%
+  column_to_rownames("C") %>%
+  replace(is.na(.), 0) %>%
+  as.matrix()
+
+og_sample_order <- colnames(ig_freq_matrix)
+og_Ig_order <- colnames(t(ig_freq_matrix))
+
+hc <-
+  ig_freq_matrix %>%
+  dist() %>%
+  hclust()
+dd_col <- as.dendrogram(hc)
+Ig_order <- order.dendrogram(dd_col)
+
+hr <-
+  ig_freq_matrix %>%
+  t() %>%
+  dist() %>%
+  hclust()
+dd_row <- as.dendrogram(hr)
+sample_order <- order.dendrogram(dd_row)
+
+ig_freq %>%
+  dplyr::rename(sample_id = sample) %>%
+  left_join(meta_RNASeq, by = "sample_id") %>%
+  filter(case_control_other_latest %in% c("Case", "Control")) %>%
+  mutate(
+    sample_id = factor(sample_id, levels = og_sample_order[sample_order])
+  ) %>%
+  ggplot(aes(x = sample_id, y = Num.Ig, fill = C)) +
+  geom_bar(stat = "identity", width = 1) +
+  facet_grid(~case_control_other_latest, scales = "free_x", space = "free") +
+  scale_fill_brewer(palette = "Paired") +
+  labs(x = NULL, y = "IG Isotype Frequency", fill = "") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+```{r}
+
+tsne_df <- readxl::read_xlsx(
+  glue("{data_dir}/interim/tsne_tcr_cdr3_tSNE_tcr_cdr3_esm2_t12_35M.xlsx"), 
+  sheet = 'in')
+
+p_tnse <- tsne_df %>% 
+  mutate(group = strex::str_after_last(Label, "_")) %>% 
+  ggplot() +
+  geom_point(aes(x = `tSNE 1`, y = `tSNE 2`, color = group),
+             size = 0.6, alpha = 0.6) +
+  ggsci::scale_color_d3() +
+  theme_light()
+
+ggplotly(p_tnse)
+
+```

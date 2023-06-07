@@ -1,0 +1,85 @@
+---
+title: "projection_pursuit"
+format: html
+editor: visual
+---
+
+## 
+
+Environment setup
+
+```{r}
+#| warning: false
+library(tidyverse)
+library(magrittr)
+library(janitor)
+library(glue)
+library(data.table)
+library(strex)
+library(parallel)
+library(doParallel)
+library(umap) 
+library(easystats)
+library(progress)
+library(tictoc)
+# plotting
+library(ggsci)
+library(patchwork)
+library(plotly)
+wkdir <- strex::str_before_last(getwd(), "/")
+data_dir <- glue("{wkdir}/data")
+src_dir <- glue("{wkdir}/notebooks")
+```
+
+Load in sample metadata
+
+\[CAUTION DONT SHARE PUBLICLY\]
+
+```{r}
+#| warnings: false
+
+static_metdata <- 
+  readRDS(glue("{data_dir}/interim/metadata/2022-11-04_static_metdata.rds")) 
+long_metdata <- 
+  readRDS(glue("{data_dir}/interim/metadata/2022-11-04_longitudinal_metadata.rds")) 
+
+rnaseq_inv <- read.csv(
+  file = glue(
+    "{data_dir}/input/metadata/2021_v2-5release_0510/",
+    "rna_sample_inventory.csv"
+  ),
+  stringsAsFactors = F, header = TRUE
+)
+
+meta_RNASeq <- rnaseq_inv %>%
+  left_join(static_metdata, by = "participant_id")
+meta_RNASeq_long <- rnaseq_inv %>% 
+  left_join(long_metdata, by = c("participant_id", "visit_month"))
+
+```
+
+Load in embedding files
+
+```{r}
+# BCR embeddings
+bcr_esm <- data.table::fread(
+  glue("{wkdir}/data/interim/airr/BCR_heavy_esm2_t30_150M.csv"),
+  header=TRUE, stringsAsFactors = FALSE
+)
+
+```
+
+```{r}
+
+bcr_esm_df <- bcr_esm %>%
+  mutate(
+    temp = strex::str_after_nth(Label, "-", 2),
+    sample_id = strex::str_before_last(temp, "_"),
+    case_control_other_latest = strex::str_after_last(temp, "_")
+  ) %>% 
+  select(-c(temp)) %>% 
+  mutate_if(is.character, factor) %>% 
+  left_join(meta_RNASeq_long, by = "participant_id")
+
+bcr_esm %>% dim
+```
