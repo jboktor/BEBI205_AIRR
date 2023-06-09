@@ -1,0 +1,746 @@
+---
+title: "Adaptive Immune Receptor Repertoire"
+editor: visual
+author: "Joe Boktor, Zach Martinez"
+date: '2023-06-09'
+format: 
+  html:
+    font-family: helvetica neue
+    page-layout: full
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    self-contained: true
+    code-fold: true
+    code-tools: true
+    fig-align: center
+bibliography: references.bib
+---
+# Introduction
+Parkinson’s Disease (PD), is a neurodegenerative disorder characterized by the progressive loss of dopaminergic neurons and the accumulation of alpha-synuclein protein aggregates. PD is widely considered to be a multifactorial disorder. Roughly 15% of incidence is attributed to a monogenic cause, suggesting a strong role for the environment in most cases of PD. The immune system, more specifically microglia, has been implicated in PD pathogenesis as the main driver of dopaminergic cell death. Recent studies have proposed a dual-hit hypothesis, suggesting that an individual's genetic makeup may predispose them to PD, but subsequent exposure to environmental toxins or other triggers initiate disease pathogenesis. Examining the Adaptive Immune Receptor Repertoires (AIRRs) of PD patients may provide valuable insights into the disease mechanisms and cellular targets of immune cells. These alterations could reflect changes in immune cell function, communication, or vulnerability to the pathological processes underlying PD.
+
+Classical methods for comparing biological sequences usually involve pairwise comparisons [@altschul_basic_1990] or by using Hidden-Markov Models [@eddy_accelerated_2011]. While these methods rely on evolutionary relationships to link related sequences through homology, machine learning based methods have shown success for functional comparisons without needing shared ancestry. However, these methods tend to rely heavily on feature selection, which not only requires background knowledge but also introduce potential bias by focusing on select features. Analogous to using words and sentences to train models such as BERT, Transformer based models such as ESM-2 use amino acids and protein sequences [@lin_evolutionary-scale_2022]. These Protein Language Models (PLMs) learn in a self-supervised manner, where the model attempts to predict the identity of a random 15% of the amino acids per sequence using the un-masked portions. ESM-2, was pre-trained on the masked language training task with 65 million unique protein sequences from UniRef. After this deep training, scientists are able to use these pre-trained models to extract high-dimensional representations for their proteins of interest. These vectors can then be used for clustering, classification and other downstream tasks that allow for functional comparisons [@bernhofer_tmbed_2022]. We plan on embedding the receptor repertoires and feeding them to downstream classification/clustering models to potentially gain deeper insights into P.D.
+
+# Dataset Source:
+
+This dataset is provided by the Accelerating Medicines Partnership Parkinson's Disease [(AMP-PD)](https://amp-pd.org/) consortium. The Mazmanian Lab has obtained tier-2 access to genomic and clinical profiles for roughly 10,000 Parkinson's Disease (PD) and Control Samples. This rich multiomic dataset contains whole blood Whole Genome Sequencing (WGS), Bulk RNA-Seq, and targeted Proteomics as well detailed clinical metadata for many samples.
+
+For this project, we are interested in examining the adaptive immune receptor repertoires of Parkinson's Disease Patients and controls. Recent advances have enabled de-convolution and assembly of individual TCR and BCR sequences from Bulk RNA-Sequencing[@song2021].
+
+# Methods
+
+**Generating Full Length Adaptive Immune Receptor Repertoires from Bulk RNA-Seq**:
+
+
+We have applied the TRUST4 [WDL pipeline](https://portal.firecloud.org/?return=terra#methods/TRUST4_bam_hg38_JB/TRUST4_bam_hg38_JB/3) to all AMP-PD RNA-Seq profiles and have aggregated the output files from a google cloud storage bucket into a shareable file. 
+
+**Embedding AIRR Sequences**:
+
+
+CDR3 amino acid sequences were passed through the ESM2 t30 150 Million parameter [model](https://huggingface.co/spaces/Yossefahmed68/facebook-esm2_t30_150M_UR50D) to generate 640 dimensional embeddings using [Trill](https://trill.readthedocs.io/en/latest/index.html). 
+
+**Feature Selection & Dimensionality Reduction**:
+
+
+Embedding data csv files range from 20-40GB in size, to reduce the dimensionality to a more managable size, we employ the minimum redundancy maximum relevance [mRMR](https://academic.oup.com/bioinformatics/article/29/18/2365/239921) ensemble feature selection algorithm to select the top 100 most diverse set of receptors for each sample.
+
+**Statistical Analysis**:
+
+We individually test the embedding dimensions of each receptor repertoire for significant differences between PD and Control groups using a two-sample t-test, as a crude first pass to identify potential differences between the two groups. 
+
+Next, we preform a subsampling procedure to determine the robustness of our observed differences in means for our embedding dimenions. The procedure is as follows: 1) randomly collect up to 100 sample IDs per group and up to 100 receptors per sample ID 2) calculate the mean value of each embedding dimension for all receptors within a group (ie, Case/Control), 3) repeat 200 times, 4) Aggregate data and collect a mean of means and calculate standard deviations from permutations. 
+
+
+
+# Results /  Conclusions
+Loading and Processing Data
+```{r}
+#| warning: false
+library(tidyverse)
+library(magrittr)
+library(janitor)
+library(glue)
+library(data.table)
+library(strex)
+library(parallel)
+library(doParallel)
+# library(coop)
+# library(distances)
+# library(umap) 
+library(easystats)
+library(progress)
+library(tictoc)
+library(fs)
+library(listenv)
+library(future)
+library(batchtools)
+library(future.batchtools)
+`%<-%` <- future::`%<-%`
+# plotting
+library(ggsci)
+library(patchwork)
+library(plotly)
+
+wkdir <- "/central/groups/MazmanianLab/joeB/BEBI205_AIRR"
+emb_dir <- glue("{wkdir}/data/input/embeddings")
+data_dir <- glue("{wkdir}/data")
+src_dir <- glue("{wkdir}/notebooks")
+source(glue("{wkdir}/notebooks/R_scripts/_misc_functions.R"))
+```
+
+
+### Exploratory Data Analysis
+Loading metadata
+
+```{r}
+#| warning: false
+core_meta <- 
+  readRDS(glue("{data_dir}/interim/metadata/2023-06-06_core-metadata.rds")) 
+long_metdata <- 
+  readRDS(glue("{data_dir}/interim/metadata/2023-06-06_longitudinal_metadata.rds")
+  ) 
+rnaseq_inv <- read.csv(
+  file = glue(
+    "{data_dir}/interim/metadata/",
+    "rna_sample_inventory.csv"
+  ),
+  stringsAsFactors = F, header = TRUE
+)
+long_metdata %<>%
+  select(
+    -c(
+      "GUID",
+      "study",
+      "diagnosis_at_baseline",
+      "diagnosis_latest",
+      "case_control_other_at_baseline",
+      "case_control_other_latest",
+      "age_at_baseline",
+      "sex",
+      "ethnicity",
+      "race",
+      "education_level_years"
+    )
+  )
+rnaseq_metadata_core <- rnaseq_inv %>% 
+  left_join(core_meta)
+rnaseq_metadata <- rnaseq_metadata_core %>% 
+  left_join(long_metdata)
+```
+
+```{r}
+#| warning: false
+#| label: fig-plot
+#| fig-cap: "Whole blood RNA-Seq sample collections timepoints across studies."
+p <-rnaseq_metadata %>% 
+  group_by(study, visit_month, case_control_other_latest) %>% 
+  summarize(n = n()) %>% 
+  mutate(total_timepoint_n = sum(n)) %>% 
+  ggplot(aes(x=visit_month, y=study)) +
+  geom_point(aes(size = n, fill=case_control_other_latest), 
+             shape = 21,
+             position = position_jitterdodge(jitter.width = 0)) +
+  labs(x = "Visit Month", y = "Cohort", fill = "Latest Diagnosis") +
+  scale_fill_d3() +
+  theme_minimal() +
+  theme(legend.position = "top")
+ggplotly(p)
+
+```
+
+
+```{r, eval = FALSE}
+# Visualizing clonotype distributions of heavy BCR chains
+airr_reports_df_processed <- readRDS(
+  glue("{wkdir}/data/interim/airr/2023-04-27_trust4_reports-processed.rds")
+)
+bcr.heavy <- airr_reports_df_processed %>% filter(receptor_chain == "heavy")
+bcr.light <- airr_reports_df_processed %>% filter(receptor_chain == "light")
+tcr <- airr_reports_df_processed %>% filter(receptor_class == "TCR")
+# Ig isotype frequency
+ig_freq <- bcr.heavy %>%
+  group_by(sample) %>%
+  mutate(est_clonal_exp_norm = frequency / sum(frequency)) %>% 
+  dplyr::filter(C != "*" & C != ".") %>%
+  group_by(sample, C) %>%
+  dplyr::summarize(Num.Ig = sum(est_clonal_exp_norm))
+
+# Sample and Ig Isotype clustering
+ig_freq_matrix <- ig_freq %>%
+  pivot_wider(values_from = "Num.Ig", names_from = "sample") %>%
+  column_to_rownames("C") %>%
+  replace(is.na(.), 0) %>%
+  as.matrix()
+
+og_sample_order <- colnames(ig_freq_matrix)
+og_Ig_order <- colnames(t(ig_freq_matrix))
+
+hc <-
+  ig_freq_matrix %>%
+  dist() %>%
+  hclust()
+dd_col <- as.dendrogram(hc)
+Ig_order <- order.dendrogram(dd_col)
+
+hr <-
+  ig_freq_matrix %>%
+  t() %>%
+  dist() %>%
+  hclust()
+dd_row <- as.dendrogram(hr)
+sample_order <- order.dendrogram(dd_row)
+
+p_clonotypes <- ig_freq %>%
+  dplyr::rename(sample_id = sample) %>%
+  left_join(rnaseq_metadata) %>%
+  filter(case_control_other_latest %in% c("Case", "Control")) %>%
+  mutate(
+    sample_id = factor(sample_id, levels = og_sample_order[sample_order])
+  ) %>%
+  ggplot(aes(x = sample_id, y = Num.Ig, fill = C)) +
+  geom_bar(stat = "identity", width = 1) +
+  facet_grid(~case_control_other_latest, scales = "free_x", space = "free") +
+  scale_fill_brewer(palette = "Paired") +
+  labs(x = NULL, y = "IG Isotype Frequency", fill = "") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+ggsave(
+  filename = glue("{wkdir}/figures/ig_isotype_freq.png"),
+  p_clonotypes,
+  width = 10,
+  height = 5
+)
+
+rnaseq_metadata_core <- rnaseq_inv %>% 
+  left_join(core_meta)
+airr_reports_df_processed %<>% 
+  mutate(receptor_chain_class = glue("{receptor_class}{receptor_chain}")) %>% 
+  dplyr::rename(sample_id = sample) %>% 
+  left_join(rnaseq_metadata_core)
+
+# Distribution of number of receptors per sample
+p_nrec <- airr_reports_df_processed %>% 
+  group_by(sample_id, receptor_chain_class) %>% 
+  summarize(n = n()) %>% 
+  left_join(rnaseq_metadata_core) %>% 
+  ggplot(aes(x=n, y=case_control_other_latest,
+             color = receptor_chain_class)) +
+  geom_point(
+    aes(color = receptor_chain_class),
+    position = position_jitterdodge(jitter.width = 0.1, jitter.height = 0),
+    alpha = 0.8) +
+  geom_boxplot(alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Number of Complete Receptors per sample", y = NULL, color = NULL) +
+  scale_color_d3() +
+  scale_x_log10() +
+  theme(legend.position = "bottom")
+
+ggsave(
+  filename = glue("{wkdir}/figures/No-of-receptors-per-sample.png"),
+  p_nrec,
+  width = 10,
+  height = 4
+)
+
+p_count_dist <- airr_reports_df_processed %>% 
+  ggplot(aes(x=count, y=case_control_other_latest,
+             color = receptor_chain_class)) +
+  geom_point(position = 
+    position_jitterdodge(jitter.width = 0.1, jitter.height = 0),
+    alpha = 0.8) +  
+    theme_bw() +
+  scale_color_d3() +
+  scale_x_log10()
+
+ggsave(
+  filename = glue("{wkdir}/figures/No-of-counts-per-receptor.png"),
+  p_count_dist,
+  width = 10,
+  height = 4
+)
+
+```
+
+![Number of complete reconstructed receptors per sample](../figures/No-of-receptors-per-sample.png){#fig-nrecep}
+
+![Number of counts per receptor](../figures/No-of-counts-per-receptor.png){#fig-ncounts}
+
+![IG Isotype Frequencies](../figures/ig_isotype_freq.png){#fig-igiso}
+
+
+Visualizing Embedding dimensions.
+
+```{r, eval = FALSE}
+pca_base_all <- plot_pca_ggplot(bcr_base_df)
+pca_base_sampleids <- bcr_base_df %>%
+  calculate_sample_means() %>%
+  plot_pca_ggplot()
+pca_base_sampleids_interact <- bcr_base_df %>%
+  calculate_sample_means() %>%
+  plot_pca()
+
+ggsave(
+  glue("{wkdir}/figures/2023-06-08_pca_bcr_base.png"),
+  pca_base_all,
+  width = 10, height = 8
+)
+ggsave(
+  glue("{wkdir}/figures/2023-06-08_pca_bcr_base_sampleid-mean.png"),
+  pca_base_sampleids,
+  width = 10, height = 8
+)
+saveRDS(pca_base_sampleids_interact, glue(
+  "{data_dir}/interim/airr/",
+  "{Sys.Date()}_PCA-UMAP_BCR-Heavy-base-sampleid-meansummary.rds"
+))
+
+```
+```{r}
+#| label: fig-pca
+#| fig-cap: "PCA embedding of all BCR-heavy CDR3 chains. The mean embedding value for each sample is represented by a point colored by group status."
+
+readRDS(glue(
+  "{data_dir}/interim/airr/",
+  "2023-06-08_PCA-UMAP_BCR-Heavy-base-sampleid-meansummary.rds"
+))
+```
+
+Viewing our data in reduced dimensionality, our PCA @fig-pca reveals considerable overlap of PD and control samples. This interestingly suggests that although the CDR3 regions of our BCR heavy sequences are highly variable and likely share little to no overlap between samples, ESM2 embeddings demonstrates functional convergence. 
+
+
+```{r}
+#| fig-cap: PCA embedding of all samples colored by cohort, samples are represented by their mean embedding value for BCR-heavy CDR3 chains.
+# dimred[["pca_sid_bcr_base_df"]]
+```
+
+
+### Statistical Analysis of Embedding Dimensions
+
+To determine if there are specific dimensions of the embeddings space that show discriminative potential for case-control status, we perform a t-test for each dimension of the embedding space and permutate across random subsamples of our data to determine the robustness of the observed difference in means.
+
+
+```{r, eval = FALSE}
+# embedding paths
+embd_paths <- list.files(
+  path = emb_dir,
+  pattern = "*.csv",
+  full.names = TRUE
+) %>%
+  keep(grepl("t30_150M", .)) %>%
+    keep(!grepl("light", .))
+
+# Defining mRMRe function
+mrmre_features_list <- function(input_path, output_path){
+  require(magrittr)
+  wkdir <- "/central/groups/MazmanianLab/joeB/BEBI205_AIRR"
+  source(glue::glue("{wkdir}/notebooks/R_scripts/_misc_functions.R"))
+  df_out <- readRDS(input_path) %>%
+    dplyr::group_by(sample_id) %>%
+    dplyr::group_map(~ mrmre_features(.), .keep = TRUE) %>%
+    dplyr::bind_rows()
+  saveRDS(df_out, file = output_path)
+}
+
+mRMRe_dir <- glue("{data_dir}/interim/airr/mRMRe-receptor-selection")
+for (epath in embd_paths[3:4]) {
+  message("Processing: ", epath)
+  filename <- fs::path_ext_remove(basename(epath))
+  tmp_chunk_dir <- glue("{mRMRe_dir}/raw_chunks/{filename}")
+  tmp_results_dir <- glue("{mRMRe_dir}/processed_chunks/{filename}")
+  dir.create(tmp_chunk_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(tmp_results_dir, recursive = TRUE, showWarnings = FALSE)
+  embd_df <- data.table::fread(epath,
+    header = TRUE, stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      temp = strex::str_after_nth(Label, "-", 2),
+      sample_id = strex::str_before_last(temp, "_"),
+      case_control_other_latest = strex::str_after_last(temp, "_")
+    ) %>%
+    select(-c(temp))
+  message(Sys.time(), " Chunking dataframe ... ")
+  # chunk 10 sample ids per job
+  n_jobs <- ceiling(length(unique(embd_df$sample_id)) / 200)
+  res <- listenv()
+  pb <- progress::progress_bar$new(
+    format = "[:bar] :percent eta: :eta",
+    total = n_jobs
+  )
+  # initialize batch input df
+  batch_input_df <- tibble()
+  for (job in 1:n_jobs) {
+    pb$tick()
+    input_ids <- chunk_func(unique(embd_df$sample_id), n_jobs)[[job]]
+    subdf <- embd_df %>% filter(sample_id %in% input_ids)
+    # save chunk in tmp
+    saveRDS(subdf, glue("{tmp_chunk_dir}/{job}.rds"))
+    batch_input_df %<>%
+      bind_rows(
+        as_tibble_row(
+          list(
+            input_path = glue("{tmp_chunk_dir}/{job}.rds"),
+            output_path = glue("{tmp_results_dir}/{job}.rds")
+          )
+        )
+      )
+  }
+  message(get_time(), " Submitting batchtools jobs ...")
+  submit_batchtools_slurm(
+    stdout_dir = glue("{get_time()}_mRMRe/"),
+    batch_df = batch_input_df,
+    run_func = mrmre_features_list
+  )
+}
+
+```
+
+Aggregating chunked outputs.
+```{r, eval = FALSE}
+bcr_base_paths <- list.files(
+  glue("{mRMRe_dir}/processed_chunks/BCR_heavy_esm2_t30_150M"),
+  full.names = TRUE
+)
+saveRDS(
+  bcr_base_paths %>%
+    purrr::map_dfr(~ readRDS(.x)) %>%
+    bind_rows(),
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "{Sys.Date()}_mRMRe-100_BCR_heavy_esm2_t30_150M.rds"
+  )
+)
+
+bcr_finetuned_paths <- list.files(
+  glue("{mRMRe_dir}/processed_chunks/finetuned_BCR-heavy_esm2_t30_150M"),
+  full.names = TRUE
+)
+saveRDS(
+  bcr_finetuned_paths %>%
+    purrr::map_dfr(~ readRDS(.x)) %>%
+    bind_rows(),
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "{Sys.Date()}_mRMRe-100_finetuned_BCR-heavy_esm2_t30_150M.rds"
+  )
+)
+
+```
+
+```{r, eval = FALSE}
+bcr_finetuned_df <- readRDS(
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "2023-06-08_mRMRe-100_finetuned_BCR-heavy_esm2_t30_150M.rds"
+  )
+)
+bcr_base_df <- readRDS(
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "2023-06-08_mRMRe-100_BCR_heavy_esm2_t30_150M.rds"
+  )
+)
+
+```
+
+
+```{r, eval = FALSE}
+
+rand_subsample_group <-
+  function(df,
+           seed,
+           ngroups = 100,
+           nsubgroups = 500) {
+    set.seed(seed)
+    rand_sampids <- df %>%
+      select(sample_id, case_control_other_latest) %>%
+      distinct() %>%
+      group_by(case_control_other_latest) %>%
+      slice_sample(n = ngroups) %>%
+      pull(sample_id)
+    df_out <- df %>%
+      filter(sample_id %in% rand_sampids) %>%
+      group_by(sample_id) %>%
+      slice_sample(n = nsubgroups) %>%
+      ungroup()
+    return(df_out)
+  }
+
+get_summary_stats <- function(df) {
+  df %>% 
+    group_by(case_control_other_latest) %>%
+    summarise_if(is.numeric, median) %>%
+    drop_na(case_control_other_latest) %>% 
+    column_to_rownames(var ="case_control_other_latest") %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    rownames_to_column(var = "embedding_dim")
+}
+
+
+plot_dimension_mean_deltas <- function(df) {
+  subsample_avgs_df <-
+    df %>%
+    mutate(
+      case_control = Case - Control,
+      case_other = Case - Other
+    ) %>%
+    group_by(embedding_dim) %>%
+    summarize_if(
+      is.numeric,
+      c(
+        "mean" = mean,
+        "median" = median,
+        "sd" = sd
+      )
+    )
+  average_embeddings_long <- subsample_avgs_df %>%
+    pivot_longer(!embedding_dim)
+
+  plot_df <- average_embeddings_long %>%
+    filter(grepl(c("case_control"), name) |
+      grepl(c("case_other"), name))
+  rank_case_control <- subsample_avgs_df %>%
+    arrange(case_control_mean) %>%
+    pull(embedding_dim)
+
+  df_ranked_case_control <- subsample_avgs_df %>%
+    arrange(case_control_mean) %>%
+    mutate(embedding_dim = factor(embedding_dim, levels = embedding_dim))
+  df_ranked_case_other <- subsample_avgs_df %>%
+    arrange(case_other_mean) %>%
+    mutate(embedding_dim = factor(embedding_dim, levels = embedding_dim))
+  p_subsamp1 <- df_ranked_case_control %>%
+    ggplot() +
+    geom_pointrange(
+      aes(
+        x = embedding_dim,
+        y = case_control_mean,
+        ymin = case_control_mean - case_control_sd,
+        ymax = case_control_mean + case_control_sd
+      ),
+      shape = 21,
+      color = "blue",
+      alpha = 0.3
+    ) +
+    geom_point(
+      aes(
+        x = embedding_dim,
+        y = case_other_mean
+      ),
+      color = "orange",
+      alpha = 0.6
+    ) +
+    theme_bw() +
+    labs(
+      x = "Embedding Dimension (Ranked by median Case - median Control)",
+      y = expression(Delta ~ " Repertoire Average by Group")
+    ) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "#EBEBEB")
+    )
+  p_subsamp2 <- df_ranked_case_other %>%
+    ggplot() +
+    geom_pointrange(
+      aes(
+        x = embedding_dim,
+        y = case_other_mean,
+        ymin = case_other_mean - case_other_sd,
+        ymax = case_other_mean + case_other_sd
+      ),
+      color = "orange",
+      alpha = 0.3
+    ) +
+    geom_point(
+      aes(
+        x = embedding_dim,
+        y = case_control_mean,
+      ),
+      color = "blue",
+      alpha = 0.6
+    ) +
+    theme_bw() +
+    labs(
+      x = "Embedding Dimension (Ranked by median Case - median Control)",
+      y = expression(Delta ~ " Repertoire Average by Group")
+    ) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "#EBEBEB")
+    )
+  patch_subsamp <- p_subsamp1 / p_subsamp2 + plot_layout(guides = "collect")
+  return(patch_subsamp)
+}
+
+
+tic()
+individual_avgs_df_ft <-
+  1:200 %>%  # 200 df subsamples
+  purrr::map(~ rand_subsample_group(bcr_finetuned_df, seed = .)) %>% 
+  purrr::map(., get_summary_stats) %>%
+  bind_rows(.id = "subsample_n")
+toc()
+
+tic()
+individual_avgs_df_base <-
+  1:200 %>%  # 200 df subsamples
+  purrr::map(~ rand_subsample_group(bcr_base_df, seed = .)) %>% 
+  purrr::map(., get_summary_stats) %>%
+  bind_rows(.id = "subsample_n")
+toc()
+
+saveRDS(
+  individual_avgs_df_ft,
+  glue("{wkdir}/data/interim/projection_pursuit/subsampled_group_avg_stats_Finetuned.rds")
+)
+saveRDS(
+  individual_avgs_df_base,
+  glue("{wkdir}/data/interim/projection_pursuit/subsampled_group_avg_stats_BASE.rds")
+)
+
+p_subsamp_ft <- plot_dimension_mean_deltas(individual_avgs_df_ft)
+p_subsamp_base <- plot_dimension_mean_deltas(individual_avgs_df_base)
+
+ggsave(glue("{wkdir}/figures/{Sys.Date()}_heavy-BCR-embeddings_subsampled-averages-median-embedding-comparisons-FINETUNED.png"),
+       p_subsamp_ft,
+       width = 7, height = 7)
+
+ggsave(glue("{wkdir}/figures/{Sys.Date()}_heavy-BCR-embeddings_subsampled-averages-median-embedding-comparisons-BASE.png"),
+       p_subsamp_base,
+       width = 7, height = 7)
+
+```
+
+
+![Average Differnce bettween PD and Control Embedding Dimensions (base model)](../figures/2023-06-09_heavy-BCR-embeddings_subsampled-averages-median-embedding-comparisons-BASE.png){#fig-permbase}
+
+![Average Differnce bettween PD and Control Embedding Dimensions (finetuned model)](../figures/2023-06-09_heavy-BCR-embeddings_subsampled-averages-median-embedding-comparisons-FINETUNED.png){#fig-permft}
+
+
+When assessing individual embedding dimensions for differences between PD and control samples, we find that the majority of dimensions are not informative; and those which are informative have modest effect sizes @fig-permbase; however, this improves considerably when using the fine-tuned model @fig-permft. This finding is corroborated by a simple T-test between sample groups @fig-ttestbase and @fig-ttestfine. These analysis are a work in progress, generative bayesian hierarchical models are currently being developed to better understand the relationship between embedding dimensions and sample groups.
+
+
+```{r, eval = FALSE}
+
+do_ttest <- function(test_col,
+                     test_df,
+                     emdedding_names) {
+  testres <-
+    emdedding_names %>%
+    purrr::set_names() %>%
+    purrr::map( ~ t.test(test_df[[.]] ~ test_df[[test_col]], na.action = na.omit) %>%
+                 report %>% as_tibble) %>%
+    bind_rows(.id = "ESM2_dim") %>%
+    mutate(Group = test_col)
+  return(testres)
+}
+embedding_ids <- paste0("D", 0:639)
+
+bcr_esm_df_base <- bcr_base_df %>%
+  dplyr::rename_at(vars(`0`:`639`), ~ paste0("D", .)) %>% 
+  mutate_if(is.character, factor) %>% 
+  left_join(rnaseq_metadata) %>% 
+  filter(case_control_other_latest != "Other") %>% 
+  as_tibble()
+ttest_results_base <- do_ttest(
+  test_df = bcr_esm_df_base,
+  test_col = "case_control_other_latest",
+  emdedding_names = embedding_ids
+)
+saveRDS(
+  ttest_results_base,
+  glue("{data_dir}/interim/projection_pursuit/base-bcr-heavy_t-tests_case_control.rds")
+)
+
+bcr_esm_df_fine <- bcr_finetuned_df %>%
+  dplyr::rename_at(vars(`0`:`639`), ~ paste0("D", .)) %>% 
+  mutate_if(is.character, factor) %>% 
+  left_join(rnaseq_metadata) %>% 
+  filter(case_control_other_latest != "Other") %>% 
+  as_tibble()
+ttest_results_fine <- do_ttest(
+  test_df = bcr_esm_df_fine,
+  test_col = "case_control_other_latest",
+  emdedding_names = embedding_ids
+)
+saveRDS(
+  ttest_results_fine,
+  glue("{data_dir}/interim/projection_pursuit/fine-tuned-bcr-heavy_t-tests_case_control.rds")
+)
+
+```
+
+Visualizing t-test results.
+```{r, eval = FALSE}
+plot_effect_size_results <- function(df) {
+  df %>%
+    arrange(Difference) %>%
+    mutate(ESM2_dim = factor(ESM2_dim, levels = ESM2_dim)) %>%
+    ggplot() +
+    geom_hline(yintercept = 0, linetype = "dotted") +
+    geom_pointrange(
+      aes(
+        x = ESM2_dim,
+        y = Difference,
+        ymin = CI_low,
+        ymax = CI_high,
+        color = -log10(p)
+      ),
+      alpha = 0.5
+    ) +
+    theme_bw() +
+    scale_color_viridis_c(option = "F") +
+    expand_limits(x = 0, y = 0) +
+    labs(
+      x = "Ranked Embedding Dimensions",
+      y = "Difference in Mean (PD - Control) \nRepertoire Embedding",
+      color = expression(-log[10] ~ "(P-value)")
+    ) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "#EBEBEB")
+    )
+}
+
+base_line_ttest_dim <- plot_effect_size_results(ttest_results_base)
+fine_line_ttest_dim <- plot_effect_size_results(ttest_results_fine)
+
+ggsave(glue("{wkdir}/figures/ttest_results_base.png"),
+       base_line_ttest_dim,
+       width = 10, height = 5)
+
+ggsave(glue("{wkdir}/figures/ttest_results_fine.png"),
+       fine_line_ttest_dim,
+       width = 10, height = 5)
+
+```
+
+![t-test results (Base Mode)](../figures/ttest_results_base.png){#fig-ttestbase}
+
+![t-test results (Finetuned Mode)](../figures/ttest_results_fine.png){#fig-ttestfine}
+
+
+# Discussion
+
+In our analysis we encounted a number of significant obstacles. Our first challenge was the immense size of the embedding dimensions being processed. To address this issue we developed highly-distributed workflows, commonly chunking our data and applying functions in parallel to utilize hundreds of cpus in the Caltech Resnick High Performance Computing Cluster simulatenously. Additionally, we applied the mRMRe feature selection algorithum to reduce the number of redundant receptor profiles being processed witihin a sample. This approach effectively reduces our dataset to a third of the size; however, the loss of potentially useful data is suboptimal.
+
+On-going and future analysis with this project will include the addition of BCR light chains and TCRs to our analysis. We will also be developing projection pursit approaches to determine if there are unique clusters or subpopulations of receptor sequences within our dataset. Using Louvain graph-based clustering we would like to assess if there are clusters within our dataset which are enriched for PD or control samples, which may potentially be informative of the disease state. Additionally, we will be developing generative bayesian hierarchical models to better understand the relationship between embedding dimensions and sample groups.
+
+# Supplementary Materials
+The Github repository for this project can be found at [here](https://github.com/jboktor/BEBI205_AIRR.git)
+
+Session Information
+```{r}
+sessionInfo()
+```
+
+# References

@@ -1,82 +1,145 @@
 # Miscellanous functions
 
-#______________________________________________________________________________
-#                     Utility Functions
-#______________________________________________________________________________
+`%nin%` <- Negate(`%in%`)
 
-
-kraken2taxtable <- function(kraken_input){
-  
-  # # TROUBLESHOOTING
-  # df_report <- read_tsv(
-  #   "input_files/UHGG_mapped/PP-3003__report_UHGG.tsv",
-  #   col_names = F, show_col_types = FALSE) %>%
-  #   dplyr::rename(relative_abundance = X1,
-  #                 clade_counts = X2,
-  #                 taxon_counts = X3,
-  #                 taxon_rank_code = X4,
-  #                 NCBI_taxon_ID = X5,
-  #                 feature = X6) %>%
-  #   rename_at(vars(-c(feature, NCBI_taxon_ID, taxon_rank_code)),
-  #             function(x) paste(x, "PP-12593", sep = "_"))
-  # df_report
-  # kraken_input <- df_report
-
-  # Filter for classical [D, P, C, O, F, G, S] # removing kingdom
-  taxon_levels <- c("D", "P", "C", "O", "F", "G", "S")
-  # Create an empty vector for taxon classification 
-  taxon_hierarchy <- vector(length = 7)
-  names(taxon_hierarchy) = taxon_levels
-  taxon_df <- tibble()
-  
-  if (any(taxon_levels %nin% unique(kraken_input$taxon_rank_code)) ) {
-    cat("  double checking taxon rank annotation ...\n")
-    kraken_input <- kraken_input %>%
-      dplyr::select(taxon_rank_code, feature) %>%
-      mutate(taxon_rank_code =
-               if_else(str_detect(feature, "d__"),"D",
-                       # if_else(str_detect(feature, "k__"),"K", # causes issues 
-                       if_else(str_detect(feature, "p__"),"P",
-                               if_else(str_detect(feature, "c__"),"C",
-                                       if_else(str_detect(feature, "o__"),"O",
-                                               if_else(str_detect(feature, "f__"),"F",
-                                                       if_else(str_detect(feature, "g__"),"G",
-                                                               if_else(str_detect(feature, "s__"), "S", taxon_rank_code
-                                                               ))))))))
-  }
-  
-  kraken_input_trim <- kraken_input %>%
-    dplyr::select(taxon_rank_code, feature) %>%
-    filter(taxon_rank_code %in% c("D", "P", "C", "O", "F", "G", "S"))
-  
-  for (feature in 1:nrow(kraken_input_trim)) {
-    # continuously update taxon hierarchy while moving down list
-    taxon_level <- kraken_input_trim[[feature, "taxon_rank_code"]]
-    taxon_hierarchy[[taxon_level]] <- 
-      gsub(paste0(tolower(taxon_level), "__"), "", kraken_input_trim[[feature, "feature"]])
-    if (taxon_level == "S"){
-      taxon_df <- rbind(taxon_df, unlist(taxon_hierarchy))
-    }
-  }
-  colnames(taxon_df) <- c("Domain", "Phylum", "Class", "Order", 
-                          "Family", "Genera", "Species")
-  return(taxon_df)
+get_time <- function(){
+  print(format(Sys.time(), "%Y-%m-%d_%H:%M:%S"))
 }
-
-#______________________________________________________________________________
-
-# function to assist in data wrangling 
-slim_report_df <- function(report){
-  
-  report_vars <- c("feature", "NCBI_taxon_ID", "taxon_rank_code")
-  
-  report %>% 
-    dplyr::select(all_of(report_vars), 
-                  contains("clade_counts")) %>% 
-    rename_at(vars(-c(feature)), 
-              function(x) gsub("clade_counts_", "", x)) %>% 
-    pivot_longer(-all_of(report_vars), names_to = "participant_id", values_to = "count")
+chunk_func <- function(x, n) {
+  split(x, cut(seq_along(x), n, labels = FALSE))
+}
+mrmre_features <- function(df) {
+  dd <- df %>%
+    dplyr::select_if(is.numeric) %>%
+    t() %>%
+    as.data.frame() %>%
+    mRMRe::mRMR.data()
+  ensemble <- mRMRe::mRMR.ensemble(
+    data = dd,
+    target_indices = 1,
+    solution_count = 1,
+    feature_count = 100
+  )
+  selected_feats <- unique(mRMRe::solutions(ensemble)$`1`[, 1])
+  return(df[selected_feats, ])
 }
 
 
-`%nin%` <- Negate( `%in%` )
+#' batchtools job submission function
+#' walltime is in seconds
+#' memory is in MB
+submit_batchtools_slurm <- function(stdout_dir, batch_df, run_func,
+                                    walltime = 3600, memory = 1000, ncpus = 1) {
+  message("\n\nCreating Registry:  ", stdout_dir, "\n")
+  breg <- batchtools::makeRegistry(
+    file.dir = glue::glue("{wkdir}/.cluster_runs/", stdout_dir),
+    seed = 42
+  )
+  breg$cluster.functions <- batchtools::makeClusterFunctionsSlurm(
+    template = glue::glue("{wkdir}/batchtools_templates/batchtools.slurm.tmpl"),
+    scheduler.latency = 0.05,
+    fs.latency = 65
+  )
+  jobs <- batchMap(
+    fun = run_func,
+    args = batch_df,
+    reg = breg
+  )
+  batchtools::submitJobs(jobs,
+    resources = list(
+      walltime = walltime,
+      memory = memory,
+      ncpus = ncpus,
+      max.concurrent.jobs = 9999
+    )
+  )
+}
+
+plot_pca <- function(df) {
+  data_df <- df %>% select_if(is.numeric)
+  labels_df <- df %>%
+    select_if(is.character) %>%
+    left_join(rnaseq_metadata)
+  pca_results <- prcomp(data_df, scale = TRUE)
+  pca_results$rotation <- -1 * pca_results$rotation
+  pca_results$x <- -1 * pca_results$x
+  percent_var <- pca_results$sdev^2 * 100 / sum(pca_results$sdev^2)
+  plot_df <- pca_results$x %>%
+    as_tibble() %>%
+    bind_cols(labels_df)
+
+  fig_pca <- plot_ly(
+    plot_df,
+    x = ~PC1,
+    y = ~PC2,
+    z = ~PC3,
+    color = ~ plot_df$case_control_other_latest
+  ) %>%
+    add_markers() %>%
+    layout(
+      scene = list(
+        xaxis = list(title = glue("{round(percent_var[1], 2)}%")),
+        yaxis = list(title = glue("{round(percent_var[2], 2)}%")),
+        zaxis = list(title = glue("{round(percent_var[3], 2)}%"))
+      )
+    )
+  return(fig_pca)
+}
+
+plot_pca_ggplot <- function(df) {
+  data_df <- df %>% select_if(is.numeric)
+  labels_df <- df %>%
+    select_if(is.character) %>%
+    left_join(rnaseq_metadata)
+  pca_results <- prcomp(data_df, scale = TRUE)
+  pca_results$rotation <- -1 * pca_results$rotation
+  pca_results$x <- -1 * pca_results$x
+  percent_var <- pca_results$sdev^2 * 100 / sum(pca_results$sdev^2)
+  plot_df <- pca_results$x %>%
+    as_tibble() %>%
+    bind_cols(labels_df)
+
+  fig_pca <- plot_df %>%
+    ggplot(aes(x = PC1, y = PC2, color = case_control_other_latest)) +
+    geom_point(size = 2) +
+    labs(
+      x = glue("{round(percent_var[1], 2)}%"),
+      y = glue("{round(percent_var[2], 2)}%")
+    ) +
+    theme_bw() +
+    scale_color_d3()
+
+  return(fig_pca)
+}
+
+plot_umap <- function(df) {
+  data_df <- df %>% select_if(is.numeric)
+  labels_df <- df %>%
+    select_if(is.character) %>%
+    left_join(rnaseq_metadata)
+  umap_results = umap(data_df, n_components = 3, random_state = 15)
+  results_df <-
+    data.frame(umap_results[["layout"]]) %>%
+    bind_cols(labels_df)
+  fig_umap <- plot_ly(
+    results_df,
+    x = ~X1,
+    y = ~X2,
+    z = ~X3,
+    color = ~ results_df$case_control_other_latest
+    ) %>%
+    add_markers() %>%
+      layout(scene = list(
+        xaxis = list(title = "0"),
+        yaxis = list(title = "1"),
+        zaxis = list(title = "2")
+      ))
+  fig_umap
+}
+
+calculate_sample_means <- function(df){
+  df %>%
+  group_by(sample_id) %>%
+  summarise_if(is.numeric, c("mean" = mean)) %>%
+  ungroup()
+}

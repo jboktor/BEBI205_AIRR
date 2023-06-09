@@ -1,91 +1,196 @@
 
 
-# options(future.globals.maxSize= 3e+9)
 
+wkdir <- "/central/groups/MazmanianLab/joeB/BEBI205_AIRR"
+emb_dir <- glue("{wkdir}/data/input/embeddings")
+data_dir <- glue("{wkdir}/data")
+source(glue("{wkdir}/notebooks/R_scripts/_misc_functions.R"))
 
-# core_metdata <- 
-#   readRDS(glue("{data_dir}/interim/metadata/2023-06-06_core-metadata.rds")) 
-
-long_metdata <- 
-  readRDS(glue("{data_dir}/interim/metadata/2023-06-06_longitudinal_metadata.rds")) 
-rnaseq_inv <- read.csv(
-  file = glue(
-    "{data_dir}/input/metadata/2021_v2-5release_0510/",
-    "rna_sample_inventory.csv"
-  ),
-  stringsAsFactors = F, header = TRUE
-)
-rnaseq_metadata <- rnaseq_inv %>% left_join(long_metdata)
 bcr_esm <- data.table::fread(
-  glue("{wkdir}/data/interim/airr/BCR_heavy_esm2_t30_150M.csv"),
+  glue("{emb_dir}/BCR_heavy_esm2_t30_150M.csv"),
   header=TRUE, stringsAsFactors = FALSE
 )
 
-bcr_esm_df <- bcr_esm %>%
+bcr_esm %<>%
   mutate(
     temp = strex::str_after_nth(Label, "-", 2),
     sample_id = strex::str_before_last(temp, "_"),
     case_control_other_latest = strex::str_after_last(temp, "_")
   ) %>% 
-  select(-c(temp)) %>% 
-  dplyr::rename_at(vars(`0`:`639`), ~ paste0("D", .)) %>% 
-  mutate_if(is.character, factor) %>% 
-  left_join(rnaseq_metadata) %>% 
-  filter(case_control_other_latest != "Other") %>% 
-  as_tibble()
+  select(-c(temp))
+
+bcr_esm %>% 
+  pull(sample_id) %>% 
+  unique() %>% length
+
+# bcr_esm_numeric <- bcr_esm %>% 
+#   group_by(sample_id) %>% 
+#   slice_sample(n=100) %>% 
+#   ungroup() %>% 
+#   column_to_rownames(var = "Label") %>% 
+#   select_if(is.numeric)
+# function to slim down data
+
+bcr_esm_numeric <- bcr_esm %>% 
+  slice_sample(n=25) %>% 
+  column_to_rownames(var = "Label") %>% 
+  select_if(is.numeric)
+bcr_esm_numeric %>% dim
 
 
-do_ttest <- function(test_col,
-                     test_df,
-                     emdedding_names) {
-  testres <-
-    emdedding_names %>%
-    purrr::set_names() %>%
-    purrr::map( ~ t.test(test_df[[.]] ~ test_df[[test_col]], na.action = na.omit) %>%
-                 report %>% as_tibble) %>%
-    bind_rows(.id = "ESM2_dim") %>%
-    mutate(Group = test_col)
-  return(testres)
-}
 
-embedding_ids <- paste0("D", 0:639)
-tic()
-ttest_results <- do_ttest(
-  test_df = bcr_esm_df,
-  test_col = "case_control_other_latest",
-  emdedding_names = embedding_ids
+  # # Initiate future.batchtools backend for parallel processing
+  # future::plan(
+  #   future.batchtools::batchtools_slurm,
+  #   template = glue("{wkdir}/batchtools_templates/batchtools.slurm.tmpl"),
+  #   resources = list(
+  #     name = glue("{get_time()}_mRMRe-processing"),
+  #     memory = "5G",
+  #     ncpus = 1,
+  #     walltime = 1200
+  #   )
+  # )
+
+
+
+
+
+# Here we are focusing on the BCR heavy chains in our analysis
+
+# here is a breakdown of IG isotypes ---- 
+
+# Other things to note about our dataset is that there is very little redundancy IG sequence detection 
+# Plot distribution of sequence counts per sample
+
+
+# Samples provided longitudinally 
+
+
+
+
+
+# Exploratory Data Analysis
+
+
+
+bcr_finetuned_df <- readRDS(
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "2023-06-08_mRMRe-100_finetuned_BCR-heavy_esm2_t30_150M.rds"
+  )
 )
-toc()
-saveRDS(
-  ttest_results,
-  glue("{data_dir}/interim/projection_pursuit/bcr-heavy_t-tests_case_control.rds")
+bcr_base_df <- readRDS(
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "2023-06-08_mRMRe-100_BCR_heavy_esm2_t30_150M.rds"
+  )
 )
 
-ttest_results %>% 
-  arrange(Difference) %>% 
-  mutate(ESM2_dim = factor(ESM2_dim, levels = ESM2_dim)) %>% 
-  ggplot() +
-  geom_hline(yintercept = 0, linetype = "dotted") +
-  geom_pointrange(
-    aes(
-      x = ESM2_dim,
-      y = Difference,
-      ymin = CI_low,
-      ymax = CI_high,
-      color = -log10(p)
-    ),
-    alpha = 0.5
-  ) +
-  theme_bw() +
-  scale_color_viridis_c(option = "F") +
-  expand_limits(x = 0, y = 0) +
-  labs(x = "Ranked Embedding Dimensions",
-       y = "Difference in Mean (PD - Control) \nRepertoire Embedding",
-       color = expression(-log[10] ~ "(P-value)")) +
-  theme(axis.text.x = element_blank(),
-        axis.ticks.x = element_blank(),
-        panel.grid = element_blank(),
-        panel.background = element_rect(fill = "#EBEBEB"))
+# BASE BCR DF
+
+pca_base_all <- plot_pca_ggplot(bcr_base_df)
+pca_base_sampleids <- bcr_base_df %>%
+  calculate_sample_means() %>%
+  plot_pca_ggplot()
+pca_base_sampleids_interact <- bcr_base_df %>%
+  calculate_sample_means() %>%
+  plot_pca()
+
+ggsave(
+  glue("{wkdir}/figures/2023-06-08_pca_bcr_base.png"),
+  pca_base_all,
+  width = 10, height = 8
+)
+ggsave(
+  glue("{wkdir}/figures/2023-06-08_pca_bcr_base_sampleid-mean.png"),
+  pca_base_sampleids,
+  width = 10, height = 8
+)
+saveRDS(pca_base_sampleids_interact, glue(
+  "{data_dir}/interim/airr/",
+  "{Sys.Date()}_PCA-UMAP_BCR-Heavy-base-sampleid-meansummary.rds"
+))
+
+readRDS(glue(
+  "{data_dir}/interim/airr/",
+  "2023-06-08_PCA-UMAP_BCR-Heavy-base-sampleid-meansummary.rds"
+))
+
+
+
+
+# dimred <- list()
+# dimred[["pca_all_bcr_base_df"]] <- plot_pca(bcr_base_df)
+# dimred[["pca_sid_bcr_base_df"]] <- bcr_base_df %>%
+#   calculate_sample_means() %>%
+#   plot_pca()
+
+
+
+
+# dimred[["umap_all_bcr_base_df"]] <- plot_umap(bcr_base_df)
+# dimred[["umap_sid_bcr_base_df"]] <- bcr_base_df %>%
+#   calculate_sample_means() %>%
+#   plot_umap()
+
+# Finetuned BCR DF
+dimred[["pca_all_bcr_ft_df"]] <- plot_pca(bcr_finetuned_df)
+dimred[["pca_sid_bcr_ft_df"]] <- bcr_finetuned_df %>%
+  calculate_sample_means() %>%
+  plot_pca()
+
+# dimred[["umap_all_bcr_ft_df"]] <- plot_umap(bcr_finetuned_df)
+# dimred[["umap_sid_bcr_ft_df"]] <- bcr_finetuned_df %>%
+#   calculate_sample_means() %>%
+#   plot_umap()
+
+saveRDS(dimred, glue(
+  "{data_dir}/interim/airr/",
+  "{Sys.Date()}_PCA-UMAP_BCR-Heavy-base-and-fine.rds"
+))
+
+# ### Finetuned ESM2 Models
+# ```{r}
+# #| fig-cap: PCA embedding of all BCR-heavy CDR3 chains.
+# dimred[["pca_all_bcr_ft_df"]]
+# ```
+
+# ```{r}
+# #| fig-cap: PCA embedding of all samples colored by cohort, samples are represented by their mean embedding value for BCR-heavy CDR3 chains.
+# dimred[["pca_sid_bcr_ft_df"]]
+# ```
+
+
+
+
+
+
+
+
+
+
+# long_metdata <-
+#   readRDS(
+#     glue("{data_dir}/interim/metadata/2023-06-06_longitudinal_metadata.rds")
+#   )
+# rnaseq_inv <- read.csv(
+#   file = glue(
+#     "{data_dir}/input/metadata/2021_v2-5release_0510/",
+#     "rna_sample_inventory.csv"
+#   ),
+#   stringsAsFactors = F, header = TRUE
+# )
+# rnaseq_metadata <- rnaseq_inv %>% left_join(long_metdata)
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -94,10 +199,9 @@ ttest_results %>%
   arrange(Difference) %>% 
   pull(ESM2_dim)
 
-
 bcr_esm_df %>% 
-  ggplot(aes(D413, color=case_control_other_latest)) +
-  geom_density(aes(D413, after_stat(scaled))) +
+  ggplot(aes(D25, color=case_control_other_latest)) +
+  geom_density(aes(D25, after_stat(scaled))) +
   # labs(title = gt) +
   geom_rug(alpha = 0.1) +
   scale_color_d3() +
@@ -125,8 +229,9 @@ as.formula(
 )
 
 
-
+library(easystats)
 library(lme4)
+
 do_lmer <- function(test_col,
                     test_df,
                     emdedding_names) {
@@ -171,6 +276,12 @@ saveRDS(
   clincal_ttest_res,
   glue("{data_dir}/interim/projection_pursuit/bcr-heavy_t-tests_clinical-metrics.rds")
 )
+
+
+
+
+
+
 
 
 do_ttest(
@@ -266,15 +377,13 @@ plot(lc, g)
 
 
 
-# library(lsa)
-library(coop)
-library(distances)
+
+
 
 bcr_esm <- data.table::fread(
   glue("{wkdir}/data/interim/airr/BCR_heavy_esm2_t30_150M.csv"),
   header=TRUE, stringsAsFactors = FALSE
 )
-
 bcr_esm %<>%
   mutate(
     temp = strex::str_after_nth(Label, "-", 2),

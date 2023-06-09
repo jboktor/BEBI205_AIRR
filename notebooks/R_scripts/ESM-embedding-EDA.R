@@ -1,4 +1,5 @@
 library(tidyverse)
+library(cli)
 library(tidymodels)
 library(baguette)
 library(xgboost)
@@ -20,7 +21,7 @@ library(plotly)
 library(vip)
 library(discrim)
 library(themis)
-library(umap) 
+library(umap)
 
 wkdir <- "/Users/josephboktor/Documents/analyses/BEBI205_AIRR"
 meta_RNASeq <- readRDS(
@@ -45,10 +46,11 @@ bcr_esm %<>%
 bcr_esm %>% glimpse
 bcr_esm$case_control_other_latest %>% table()
 # on average there are about 200-300 heavy BCR chains measured per donor
-bcr_esm$sample_id %>% table() %>%
-  as.data.frame() %>% 
+bcr_esm$sample_id %>%
+  table() %>%
+  as.data.frame() %>%
   ggplot() +
-  geom_histogram(aes(x=Freq), bins = 100)
+  geom_histogram(aes(x = Freq), bins = 100)
 
 
 
@@ -77,140 +79,11 @@ bcr_esm_model_df <- bcr_esm %>%
 #_______________________________________________________________________________
 
 
-rand_subsample_group <-
-  function(df,
-           seed,
-           ngroups = 100,
-           nsubgroups = 500) {
-    set.seed(seed)
-    rand_sampids <- df %>%
-      select(sample_id, case_control_other_latest) %>%
-      distinct() %>%
-      group_by(case_control_other_latest) %>%
-      slice_sample(n = ngroups) %>%
-      pull(sample_id)
-    df_out <- df %>%
-      filter(sample_id %in% rand_sampids) %>%
-      group_by(sample_id) %>%
-      slice_sample(n = nsubgroups) %>%
-      ungroup()
-    return(df_out)
-  }
-
-get_summary_stats <- function(df) {
-  df %>% 
-    group_by(case_control_other_latest) %>%
-    summarise_if(is.numeric, median) %>%
-    column_to_rownames(var ="case_control_other_latest") %>% 
-    t() %>% 
-    as.data.frame() %>% 
-    rownames_to_column(var = "embedding_dim")
-}
 
 
-individual_avgs_df <-
-  1:50 %>%  # 50 df subsamples
-  purrr::map(~ rand_subsample_group(bcr_esm, seed = .)) %>% 
-  purrr::map(., get_summary_stats) %>% 
-  bind_rows(.id = "subsample_n")
-
-subsample_avgs_df <-
-  individual_avgs_df %>%
-  mutate(case_control = Case - Control,
-         case_other = Case - Other) %>%
-  group_by(embedding_dim) %>%
-  summarize_if(is.numeric,
-               c(
-                 "mean" = mean,
-                 "median" = median,
-                 "sd" = sd
-               ))
-
-average_embeddings_long <- subsample_avgs_df %>% 
-  pivot_longer(!embedding_dim)
-
-plot_df <- average_embeddings_long %>% 
-  filter(grepl(c("case_control"), name) | 
-           grepl(c("case_other"), name))
-  # mutate(embedding_dim = factor(embedding_dim, levels = rank_case_control)) %>% 
 
 
-rank_case_control <- subsample_avgs_df %>% 
-  arrange(case_control_mean) %>% 
-  pull(embedding_dim)
 
-df_ranked_case_control <- subsample_avgs_df %>% 
-  arrange(case_control_mean) %>% 
-  mutate(embedding_dim = factor(embedding_dim, levels = embedding_dim))
-df_ranked_case_other <- subsample_avgs_df %>% 
-  arrange(case_other_mean) %>% 
-  mutate(embedding_dim = factor(embedding_dim, levels = embedding_dim))
-
-
-p_subsamp1 <- df_ranked_case_control %>% 
-  ggplot() +
-  geom_pointrange(
-    aes(
-      x = embedding_dim,
-      y = case_control_mean,
-      ymin = case_control_mean-case_control_sd,
-      ymax = case_control_mean+case_control_sd
-    ),
-    shape = 21,
-    color = "blue",
-    alpha = 0.3
-  ) +
-  geom_point(
-    aes(
-      x = embedding_dim,
-      y = case_other_mean
-    ),
-    
-    color = "orange",
-    alpha =  0.6
-  ) +
-  theme_bw() +
-  labs(x ="Embedding Dimension (Ranked by median Case - median Control)", 
-       y = expression(Delta ~ " Repertoire Average by Group")) + 
-  theme(axis.text.x = element_blank(),
-        axis.ticks.x = element_blank(),
-        panel.grid = element_blank(),
-        panel.background = element_rect(fill = "#EBEBEB"))
-  
-
-p_subsamp2 <- df_ranked_case_other %>% 
-  ggplot() +
-  geom_pointrange(
-    aes(
-      x = embedding_dim,
-      y = case_other_mean,
-      ymin = case_other_mean-case_other_sd,
-      ymax = case_other_mean+case_other_sd
-    ),
-    color = "orange",
-    alpha = 0.3
-  ) +
-  geom_point(
-    aes(
-      x = embedding_dim,
-      y = case_control_mean,
-    ),
-    color = "blue",
-    alpha = 0.6
-  ) +
-  theme_bw() +
-  labs(x ="Embedding Dimension (Ranked by median Case - median Control)", 
-       y = expression(Delta ~ " Repertoire Average by Group")) + 
-  theme(axis.text.x = element_blank(),
-        axis.ticks.x = element_blank(),
-        panel.grid = element_blank(),
-        panel.background = element_rect(fill = "#EBEBEB"))
-
-
-patch_subsamp <- p_subsamp1 / p_subsamp2 + plot_layout(guides = 'collect')
-ggsave(glue("{wkdir}/figures/heavy-BCR-embeddings_subsampled-averages-median-embedding-comparisons.png"),
-       patch_subsamp,
-       width = 7, height = 7)
 
 
 #______________________________________________________________________________
@@ -464,28 +337,44 @@ collect_predictions(comp_fitted) %>%
 # LASSO MODEL ----
 #_______________________________________________________________________________
 
-embedding_avg_tbl <- bcr_esm %>%
-  group_by(sample_id, case_control_other_latest) %>%
-  summarise_if(is.numeric, median) %>%
-  as_tibble() %>% 
-  dplyr::rename_at(vars(`0`:`639`), ~ paste0("D", .) )
+library(tidymodels)
 
-bcr_esm$sample_id %>% unique() %>% length
-
-# bcr_split <- initial_split(
-#   embedding_avg_tbl, 
-#   strata = case_control_other_latest
-# )
-# bcr_train <- training(bcr_split)
-# bcr_test <- testing(bcr_split)
-# bcr_folds <- vfold_cv(bcr_train, strata = case_control_other_latest)
-
-bcr_split <- rsample::group_initial_split(
-  bcr_esm, 
-  group = sample_id,
-  strata = case_control_other_latest
+bcr_finetuned_df <- readRDS(
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "2023-06-08_mRMRe-100_finetuned_BCR-heavy_esm2_t30_150M.rds"
+  )
+)
+bcr_base_df <- readRDS(
+  glue(
+    "{data_dir}/interim/airr/mRMRe-receptor-selection/",
+    "2023-06-08_mRMRe-100_BCR_heavy_esm2_t30_150M.rds"
+  )
 )
 
+
+
+embedding_avg_tbl <- bcr_base_df %>%
+  group_by(sample_id, case_control_other_latest) %>%
+  summarise_if(is.numeric, median) %>%
+  as_tibble() %>%
+  dplyr::rename_at(vars(`0`:`639`), ~ paste0("D", .))
+
+# bcr_esm$sample_id %>% unique() %>% length
+
+bcr_split <- initial_split(
+  embedding_avg_tbl,
+  strata = case_control_other_latest
+)
+bcr_train <- training(bcr_split)
+bcr_test <- testing(bcr_split)
+bcr_folds <- vfold_cv(bcr_train, strata = case_control_other_latest)
+
+# bcr_split <- rsample::group_initial_split(
+#   embedding_avg_tbl,
+#   group = sample_id,
+#   strata = case_control_other_latest
+# )
 bcr_train <- training(bcr_split)
 bcr_test <- testing(bcr_split)
 # bcr_folds <- vfold_cv(bcr_train, strata = case_control_other_latest)

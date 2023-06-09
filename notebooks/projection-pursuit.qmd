@@ -18,17 +18,28 @@ library(data.table)
 library(strex)
 library(parallel)
 library(doParallel)
+library(coop)
+library(distances)
 library(umap) 
 library(easystats)
 library(progress)
 library(tictoc)
+library(fs)
+library(listenv)
+library(future)
+library(batchtools)
+library(future.batchtools)
+`%<-%` <- future::`%<-%`
 # plotting
 library(ggsci)
 library(patchwork)
 library(plotly)
-wkdir <- strex::str_before_last(getwd(), "/")
+
+wkdir <- "/central/groups/MazmanianLab/joeB/BEBI205_AIRR"
+emb_dir <- glue("{wkdir}/data/input/embeddings")
 data_dir <- glue("{wkdir}/data")
 src_dir <- glue("{wkdir}/notebooks")
+source(glue("{wkdir}/notebooks/R_scripts/_misc_functions.R"))
 ```
 
 Load in sample metadata
@@ -37,7 +48,6 @@ Load in sample metadata
 
 ```{r}
 #| warnings: false
-
 static_metdata <- 
   readRDS(glue("{data_dir}/interim/metadata/2022-11-04_static_metdata.rds")) 
 long_metdata <- 
